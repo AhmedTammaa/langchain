@@ -4,8 +4,8 @@ import copy
 import pathlib
 from io import BytesIO, StringIO
 from typing import Any, Dict, Iterable, List, Optional, Tuple, TypedDict, cast
-
-import requests
+from bs4 import BeautifulSoup
+import bs4
 from langchain_core.documents import Document
 
 from langchain_text_splitters.character import RecursiveCharacterTextSplitter
@@ -40,8 +40,11 @@ class HTMLHeaderTextSplitter:
             return_each_element: Return each element w/ associated headers.
         """
         # Output element-by-element or aggregated into chunks w/ common headers
-        self.return_each_element = return_each_element
-        self.headers_to_split_on = sorted(headers_to_split_on)
+        self.headers_to_split_on = sorted(headers_to_split_on, key=lambda x: int(x[0][1]))
+        self.header_mapping = dict(self.headers_to_split_on)
+        
+        # Extract just the header tags from the tuple list
+        self.header_tags = [tag for tag, _ in self.headers_to_split_on]
 
     def aggregate_elements_to_chunks(
         self, elements: List[ElementType]
@@ -90,79 +93,94 @@ class HTMLHeaderTextSplitter:
         """
         return self.split_text_from_file(StringIO(text))
 
+
+    def _header_level(self, tag_name: str) -> int:
+        # Safe extraction of header level (e.g., h1 -> 1)
+        if tag_name.startswith('h') and len(tag_name) > 1 and tag_name[1].isdigit():
+            return int(tag_name[1])
+        return 999  # some large number if not a standard heading
+
     def split_text_from_file(self, file: Any) -> List[Document]:
-        """Split HTML file.
+        if isinstance(file, str):
+            with open(file, 'r', encoding='utf-8') as f:
+                html_content = f.read()
+        else:
+            html_content = file.read()
 
-        Args:
-            file: HTML file
-        """
-        try:
-            from lxml import etree
-        except ImportError as e:
-            raise ImportError(
-                "Unable to import lxml, please install with `pip install lxml`."
-            ) from e
-        # use lxml library to parse html document and return xml ElementTree
-        # Explicitly encoding in utf-8 allows non-English
-        # html files to be processed without garbled characters
-        parser = etree.HTMLParser(encoding="utf-8")
-        tree = etree.parse(file, parser)
+        soup = BeautifulSoup(html_content, 'html.parser')
+        body = soup.body if soup.body else soup
 
-        # document transformation for "structure-aware" chunking is handled with xsl.
-        # see comments in html_chunks_with_headers.xslt for more detailed information.
-        xslt_path = pathlib.Path(__file__).parent / "xsl/html_chunks_with_headers.xslt"
-        xslt_tree = etree.parse(xslt_path)
-        transform = etree.XSLT(xslt_tree)
-        result = transform(tree)
-        result_dom = etree.fromstring(str(result))
+        # Consider only headers and <p> tags 
+        # for text extraction to avoid duplication
+        search_tags = self.header_tags + ["p"]
+        elements = body.find_all(search_tags)
 
-        # create filter and mapping for header metadata
-        header_filter = [header[0] for header in self.headers_to_split_on]
-        header_mapping = dict(self.headers_to_split_on)
+        documents = []
+        current_hierarchy = {}
+        current_content = []
 
-        # map xhtml namespace prefix
-        ns_map = {"h": "http://www.w3.org/1999/xhtml"}
-
-        # build list of elements from DOM
-        elements = []
-        for element in result_dom.findall("*//*", ns_map):
-            if element.findall("*[@class='headers']") or element.findall(
-                "*[@class='chunk']"
-            ):
-                elements.append(
-                    ElementType(
-                        url=file,
-                        xpath="".join(
-                            [
-                                node.text or ""
-                                for node in element.findall("*[@class='xpath']", ns_map)
-                            ]
-                        ),
-                        content="".join(
-                            [
-                                node.text or ""
-                                for node in element.findall("*[@class='chunk']", ns_map)
-                            ]
-                        ),
-                        metadata={
-                            # Add text of specified headers to metadata using header
-                            # mapping.
-                            header_mapping[node.tag]: node.text or ""
-                            for node in filter(
-                                lambda x: x.tag in header_filter,
-                                element.findall("*[@class='headers']/*", ns_map),
-                            )
-                        },
+        def add_document():
+            """Helper to finalize and\
+             add a document if current_content is not empty."""
+            if current_content:
+                documents.append(
+                    Document(
+                        page_content=" ".join(current_content).strip(),
+                        metadata=current_hierarchy.copy()
                     )
                 )
+                current_content.clear()
 
-        if not self.return_each_element:
-            return self.aggregate_elements_to_chunks(elements)
-        else:
-            return [
-                Document(page_content=chunk["content"], metadata=chunk["metadata"])
-                for chunk in elements
-            ]
+        first_header_encountered = False
+
+        for element in elements:
+            tag_name = element.name.lower()
+            if tag_name in self.header_tags:
+                # If this is the first header encountered, 
+                #and we have pre-header text,
+                # finalize the pre-header chunk now.
+                if not first_header_encountered and current_content:
+                    # Add chunk for pre-header text with no header metadata
+                    add_document()
+
+                first_header_encountered = True
+
+                # Finalize previous content before starting a new header block
+                add_document()
+
+                # Determine header level
+                new_level = self._header_level(tag_name)
+
+                # Prune headers in current_hierarchy 
+                # that are deeper or same level
+                to_remove = []
+                for k in current_hierarchy.keys():
+                    if k.lower().startswith("header"):
+                        parts = k.split()
+                        if parts[-1].isdigit():
+                            existing_level = int(parts[-1])
+                            if existing_level >= new_level:
+                                to_remove.append(k)
+
+                for k in to_remove:
+                    del current_hierarchy[k]
+
+                # Add/update the current header
+                header_key = self.header_mapping.get(tag_name, tag_name)
+                current_hierarchy[header_key] = element.get_text(
+                    separator=' ', strip=True
+                    )
+            else:
+                # Normal text element (e.g., <p>)
+                text = element.get_text(separator=' ', strip=True)
+                if text:
+                    current_content.append(text)
+
+
+        add_document()
+
+        return documents
+
 
 
 class HTMLSectionSplitter:
